@@ -967,8 +967,8 @@ static void mxt_input_report(struct mxt_data *data, int single_id)
 		 * outside screen area. Send a release event in
 		 * such cases to avoid unwanted touches.
 		 */
-		if (finger[id].x <= data->pdata->panel_minx ||
-				finger[id].x >= data->pdata->panel_maxx ||
+		if (finger[id].x <= data->pdata->panel_minx +50 ||
+				finger[id].x >= data->pdata->panel_maxx - 50 ||
 				finger[id].y <= data->pdata->panel_miny ||
 				finger[id].y >= data->pdata->panel_maxy) {
 			finger[id].status = MXT_RELEASE;

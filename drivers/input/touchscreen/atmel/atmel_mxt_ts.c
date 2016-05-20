@@ -1964,7 +1964,7 @@ static void mxt_proc_t100_message(struct mxt_data *data, u8 *message)
 
     input_mt_slot(input_dev, id);
     
-	if (status & MXT_T100_DETECT) {
+	if ((status & MXT_T100_DETECT) && (x > 30 && x < 1020)) {
 		/* A reported size of zero indicates that the reported touch
 		 * is a stylus from a linked Stylus T47 object. */
 		if ((status & MXT_T100_TYPE_MASK) == MXT_T100_TYPE_STYLUS)
