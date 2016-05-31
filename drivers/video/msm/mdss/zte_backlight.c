@@ -6,7 +6,6 @@
 #include <linux/err.h>
 
 #include "zte_backlight.h"
-#include "zte_disp_enhance.h"
 #include "zte_backlight_data.h"
 #include "mdss_dsi.h"
 

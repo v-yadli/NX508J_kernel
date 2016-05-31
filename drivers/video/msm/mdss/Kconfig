@@ -17,11 +17,6 @@ config ZTEMT_MIPI_1080P_R63417_SHARP_IPS_5P5
 	---help---
     This option enables support 5.5 inch LCD.
 	
-config ZTEMT_LCD_DISP_ENHANCE
-	bool "ZTEMT LCD disp enhance"
-	---help---
-	  ztemt lcd clor enhance.
-
 config ZTEMT_LCD_1080P_R63315_SHARP_IPS_5P0
 	bool "ZTEMT MIPI 1080P 5P0 PANEL"
 	---help---
@@ -85,3 +80,11 @@ config FB_MSM_MDSS_XLOG_DEBUG
 	features to: Dump MDSS registers during driver errors, panic
 	driver during fatal errors and enable some display-driver logging
 	into an internal buffer (this avoids logging overhead).
+
+config FB_MSM_MDSS_KCAL_CTRL 
+	depends on FB_MSM_MDSS 
+	bool "MDSS color control" 
+	---help--- 
+	Enable sysfs for post-processing control of mdss-mdp5 display 
+	controllers in MDSS. 
+

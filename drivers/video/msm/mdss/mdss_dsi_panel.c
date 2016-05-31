@@ -24,7 +24,6 @@
 
 #include "mdss_dsi.h"
 
-#include "zte_disp_enhance.h"
 #define DT_CMD_HDR 6
 #define MIN_REFRESH_RATE 30
 
@@ -660,10 +659,6 @@ static int mdss_dsi_panel_off(struct mdss_panel_data *pdata)
 	if (ctrl->off_cmds.cmd_cnt)
 		mdss_dsi_panel_cmds_send(ctrl, &ctrl->off_cmds);
 	
-#ifdef CONFIG_ZTEMT_LCD_DISP_ENHANCE
-  zte_set_ctrl_point(NULL);
-#endif
-
 end:
 	pinfo->blank_state = MDSS_PANEL_BLANK_BLANK;
 	pr_debug("%s:-\n", __func__);

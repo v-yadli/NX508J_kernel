@@ -28,7 +28,6 @@
 #include "mdss_panel.h"
 #include "mdss_dsi.h"
 #include "mdss_debug.h"
-#include "zte_disp_enhance.h"
 
 #define XO_CLK_RATE	19200000
 
@@ -838,10 +837,6 @@ static int mdss_dsi_unblank(struct mdss_panel_data *pdata)
 		}
 		ctrl_pdata->ctrl_state |= CTRL_STATE_PANEL_INIT;
 	}
-#ifdef CONFIG_ZTEMT_LCD_DISP_ENHANCE
-	pr_err("%s:\n", __func__);
-		zte_boot_begin_enhance(ctrl_pdata);
-#endif
 
 	if ((pdata->panel_info.type == MIPI_CMD_PANEL) &&
 		mipi->vsync_enable && mipi->hw_vsync_mode) {
