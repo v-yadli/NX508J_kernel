@@ -28,6 +28,8 @@
 #include <sound/q6afe-v2.h>
 #include <sound/q6core.h>
 #include <sound/pcm_params.h>
+#include <soc/qcom/liquid_dock.h>
+#include "device_event.h"
 #include "qdsp6v2/msm-pcm-routing-v2.h"
 #include "../codecs/ak4961.h"
 #include "../codecs/ak4961-jde.h"
@@ -89,12 +91,10 @@ struct msm8994_asoc_mach_data {
 	struct msm_pinctrl_info pinctrl_info;
 	void __iomem *pri_mux;
 	void __iomem *sec_mux;
-	u32 pri_mi2s_clk_usrs; // chenjun
 };
 
 static int slim0_rx_sample_rate = SAMPLING_RATE_48KHZ;
 static int slim0_rx_bit_format = SNDRV_PCM_FORMAT_S16_LE;
-static int slim0_tx_bit_format = SNDRV_PCM_FORMAT_S16_LE;
 static int hdmi_rx_bit_format = SNDRV_PCM_FORMAT_S16_LE;
 static int msm8994_auxpcm_rate = 8000;
 
@@ -103,21 +103,17 @@ static int ext_us_amp_gpio = -1;
 static int msm8994_spk_control = 1;
 static int msm_slim_0_rx_ch = 1;
 static int msm_slim_0_tx_ch = 1;
-
-// chenjun
-static int codec_mclk_control = 0;
-//
+static int msm_vi_feed_tx_ch = 2;
+#ifdef CONFIG_HEADPHONE_SWITCH
+static int headphone_switch_gpio = -1;
+static int tps_enable_gpio = -1;
+#endif
 
 static int msm_btsco_rate = SAMPLING_RATE_8KHZ;
 static int msm_hdmi_rx_ch = 2;
 static int msm_proxy_rx_ch = 2;
 static int hdmi_rx_sample_rate = SAMPLING_RATE_48KHZ;
-static int msm_pri_mi2s_tx_ch = 1; // chenjun:EC Ref only support mono
-// chenjun
-static int msm_pri_mi2s_bit_format = SNDRV_PCM_FORMAT_S16_LE;
-static int msm_pri_mi2s_sample_rate = SAMPLING_RATE_48KHZ;
-static atomic_t prim_mi2s_ref_count;
-//
+static int msm_pri_mi2s_tx_ch = 2;
 
 static struct mutex cdc_mclk_mutex;
 static struct clk *codec_clk;
@@ -125,10 +121,32 @@ static int clk_users;
 static atomic_t prim_auxpcm_rsc_ref;
 static atomic_t sec_auxpcm_rsc_ref;
 
+struct audio_plug_dev {
+	int plug_gpio;
+	int plug_irq;
+	int plug_det;
+	struct work_struct irq_work;
+	struct switch_dev audio_sdev;
+};
+
+static struct audio_plug_dev *msm8994_liquid_dock_dev;
+
+/* Rear panel audio jack which connected to LO1&2 */
+static struct audio_plug_dev *apq8094_db_ext_bp_out_dev;
+/* Front panel audio jack which connected to LO3&4 */
+static struct audio_plug_dev *apq8094_db_ext_fp_in_dev;
+/* Front panel audio jack which connected to Line in (ADC6) */
+static struct audio_plug_dev *apq8094_db_ext_fp_out_dev;
+
+
 static const char *const pin_states[] = {"sleep", "auxpcm-active",
 					 "mi2s-active", "active"};
 static const char *const spk_function[] = {"Off", "On"};
+#ifdef CONFIG_HEADPHONE_SWITCH
+static const char *const headphone_switch_text[] = {"Off", "On"};
+#endif
 static const char *const slim0_rx_ch_text[] = {"One", "Two"};
+static const char *const vi_feed_ch_text[] = {"One", "Two"};
 static const char *const slim0_tx_ch_text[] = {"One", "Two", "Three", "Four",
 						"Five", "Six", "Seven",
 						"Eight"};
@@ -171,12 +189,57 @@ static struct ak4961_mbhc_config mbhc_cfg = {
 static struct afe_clk_cfg mi2s_tx_clk = {
 	AFE_API_VERSION_I2S_CONFIG,
 	Q6AFE_LPASS_IBIT_CLK_1_P536_MHZ,
-	Q6AFE_LPASS_OSR_CLK_12_P288_MHZ,
+	Q6AFE_LPASS_OSR_CLK_DISABLE,
 	Q6AFE_LPASS_CLK_SRC_INTERNAL,
 	Q6AFE_LPASS_CLK_ROOT_DEFAULT,
-	Q6AFE_LPASS_MODE_BOTH_VALID,
+	Q6AFE_LPASS_MODE_CLK1_VALID,
 	0,
 };
+#ifdef CONFIG_HEADPHONE_SWITCH
+static int headphone_switch_gpio_get(struct snd_kcontrol *kcontrol,
+	struct snd_ctl_elem_value *ucontrol)
+{
+
+    if(headphone_switch_gpio >= 0) {
+        printk("headphone_switch_gpio_get gpio value is %d\n",gpio_get_value(headphone_switch_gpio));
+        ucontrol->value.integer.value[0] = gpio_get_value(headphone_switch_gpio);
+    }
+
+    if(tps_enable_gpio >= 0) {
+        printk("headphone_switch_gpio_get gpio value is %d\n",gpio_get_value(tps_enable_gpio));
+        ucontrol->value.integer.value[0] = gpio_get_value(tps_enable_gpio);
+    }
+    return 0;
+}
+
+static int headphone_switch_gpio_put(struct snd_kcontrol *kcontrol,
+        struct snd_ctl_elem_value *ucontrol)
+{
+    switch (ucontrol->value.integer.value[0]) {
+        case 1:
+            if(headphone_switch_gpio >=0) {
+                gpio_direction_output(headphone_switch_gpio,1);
+                printk("headphone_switch_gpio_put gpio value is %d\n",gpio_get_value(headphone_switch_gpio));
+            }
+            if(tps_enable_gpio >=0) {
+                gpio_direction_output(tps_enable_gpio ,1);
+                printk("headphone_switch_gpio_put gpio value is %d\n",gpio_get_value(tps_enable_gpio));
+            }
+            break;
+        default:
+            if(headphone_switch_gpio >= 0) {
+                gpio_direction_output(headphone_switch_gpio,0);
+                printk("headphone_switch_gpio_put gpio value is %d\n",gpio_get_value(headphone_switch_gpio));
+            }
+            if(tps_enable_gpio >= 0) {
+                gpio_direction_output(tps_enable_gpio,0);
+                printk("headphone_switch_gpio_put gpio value is %d\n",gpio_get_value(tps_enable_gpio));
+            }
+            break;
+    }
+    return 0;
+}
+#endif
 
 static inline int param_is_mask(int p)
 {
@@ -199,6 +262,298 @@ static void param_set_mask(struct snd_pcm_hw_params *p, int n, unsigned bit)
 		m->bits[1] = 0;
 		m->bits[bit >> 5] |= (1 << (bit & 31));
 	}
+}
+
+static irqreturn_t msm8994_audio_plug_device_irq_handler(int irq, void *dev)
+{
+	struct audio_plug_dev *dock_dev = dev;
+
+	/* switch speakers should not run in interrupt context */
+	schedule_work(&dock_dev->irq_work);
+	return IRQ_HANDLED;
+}
+
+static int msm8994_audio_plug_device_init
+				(struct audio_plug_dev *audio_plug_dev,
+				 int plug_gpio,
+				 char *node_name,
+				 char *switch_dev_name,
+				 void (*irq_work)(struct work_struct *work))
+{
+	int ret = 0;
+
+	/* awaike by plug in device OR unplug one of them */
+	u32 plug_irq_flags = IRQF_TRIGGER_RISING | IRQF_TRIGGER_FALLING;
+
+	audio_plug_dev =
+		kzalloc(sizeof(*audio_plug_dev), GFP_KERNEL);
+	if (!audio_plug_dev) {
+		pr_err("audio_plug_device alloc fail. dev_name= %s\n",
+					node_name);
+		ret = -ENOMEM;
+		goto exit;
+	}
+
+	audio_plug_dev->plug_gpio = plug_gpio;
+
+	ret = gpio_request(audio_plug_dev->plug_gpio,
+					   node_name);
+	if (ret) {
+		pr_err("%s:failed request audio_plug_device device_name = %s err= 0x%x\n",
+			__func__, node_name, ret);
+		ret = -EINVAL;
+		goto release_audio_plug_device;
+	}
+
+	ret = gpio_direction_input(audio_plug_dev->plug_gpio);
+
+	audio_plug_dev->plug_det =
+			gpio_get_value(audio_plug_dev->plug_gpio);
+	audio_plug_dev->plug_irq =
+		gpio_to_irq(audio_plug_dev->plug_gpio);
+
+	ret = request_irq(audio_plug_dev->plug_irq,
+				msm8994_audio_plug_device_irq_handler,
+				plug_irq_flags,
+				node_name,
+				audio_plug_dev);
+	if (ret < 0) {
+		pr_err("%s: Request Irq Failed err = %d\n",
+				__func__, ret);
+		goto fail_gpio;
+	}
+
+	audio_plug_dev->audio_sdev.name = switch_dev_name;
+	if (switch_dev_register(
+		&audio_plug_dev->audio_sdev) < 0) {
+		pr_err("%s: audio plug device register in switch diretory failed\n",
+		__func__);
+		goto fail_switch_dev;
+	}
+
+	switch_set_state(&audio_plug_dev->audio_sdev,
+					!(audio_plug_dev->plug_det));
+
+	/*notify to audio deamon*/
+	sysfs_notify(&audio_plug_dev->audio_sdev.dev->kobj,
+				NULL, "state");
+
+	INIT_WORK(&audio_plug_dev->irq_work,
+			irq_work);
+
+	return 0;
+
+fail_switch_dev:
+	free_irq(audio_plug_dev->plug_irq,
+				audio_plug_dev);
+fail_gpio:
+	gpio_free(audio_plug_dev->plug_gpio);
+release_audio_plug_device:
+	kfree(audio_plug_dev);
+exit:
+	audio_plug_dev = NULL;
+	return ret;
+
+}
+
+static void msm8994_audio_plug_device_remove
+				(struct audio_plug_dev *audio_plug_dev)
+{
+	if (audio_plug_dev != NULL) {
+		switch_dev_unregister(&audio_plug_dev->audio_sdev);
+
+		if (audio_plug_dev->plug_irq)
+			free_irq(audio_plug_dev->plug_irq,
+				 audio_plug_dev);
+
+		if (audio_plug_dev->plug_gpio)
+			gpio_free(audio_plug_dev->plug_gpio);
+
+		kfree(audio_plug_dev);
+		audio_plug_dev = NULL;
+	}
+}
+
+static void msm8994_liquid_docking_irq_work(struct work_struct *work)
+{
+	struct audio_plug_dev *dock_dev =
+		container_of(work, struct audio_plug_dev, irq_work);
+
+	dock_dev->plug_det =
+		gpio_get_value(dock_dev->plug_gpio);
+
+	switch_set_state(&dock_dev->audio_sdev, dock_dev->plug_det);
+	/*notify to audio deamon*/
+	sysfs_notify(&dock_dev->audio_sdev.dev->kobj, NULL, "state");
+}
+
+static int msm8994_liquid_dock_notify_handler(struct notifier_block *this,
+					unsigned long dock_event,
+					void *unused)
+{
+	int ret = 0;
+	/* plug in docking speaker+plug in device OR unplug one of them */
+	u32 dock_plug_irq_flags = IRQF_TRIGGER_RISING | IRQF_TRIGGER_FALLING |
+					IRQF_SHARED;
+	if (dock_event) {
+		ret = gpio_request(msm8994_liquid_dock_dev->plug_gpio,
+					   "dock-plug-det-irq");
+		if (ret) {
+			pr_err("%s:failed request msm8994_liquid_plug_gpio err = %d\n",
+				__func__, ret);
+			ret = -EINVAL;
+			goto fail_dock_gpio;
+		}
+
+		msm8994_liquid_dock_dev->plug_det =
+			gpio_get_value(msm8994_liquid_dock_dev->plug_gpio);
+		msm8994_liquid_dock_dev->plug_irq =
+			gpio_to_irq(msm8994_liquid_dock_dev->plug_gpio);
+
+		ret = request_irq(msm8994_liquid_dock_dev->plug_irq,
+				  msm8994_audio_plug_device_irq_handler,
+				  dock_plug_irq_flags,
+				  "liquid_dock_plug_irq",
+				  msm8994_liquid_dock_dev);
+		if (ret < 0) {
+			pr_err("%s: Request Irq Failed err = %d\n",
+				__func__, ret);
+			goto fail_dock_gpio;
+		}
+
+		switch_set_state(&msm8994_liquid_dock_dev->audio_sdev,
+				msm8994_liquid_dock_dev->plug_det);
+		/*notify to audio deamon*/
+		sysfs_notify(&msm8994_liquid_dock_dev->audio_sdev.dev->kobj,
+				NULL, "state");
+	} else {
+		if (msm8994_liquid_dock_dev->plug_irq)
+			free_irq(msm8994_liquid_dock_dev->plug_irq,
+				 msm8994_liquid_dock_dev);
+
+		if (msm8994_liquid_dock_dev->plug_gpio)
+			gpio_free(msm8994_liquid_dock_dev->plug_gpio);
+	}
+	return NOTIFY_OK;
+
+fail_dock_gpio:
+	gpio_free(msm8994_liquid_dock_dev->plug_gpio);
+
+	return NOTIFY_DONE;
+}
+
+
+static struct notifier_block msm8994_liquid_docking_notifier = {
+	.notifier_call  = msm8994_liquid_dock_notify_handler,
+};
+
+static int msm8994_liquid_init_docking(void)
+{
+	int ret = 0;
+	int plug_gpio = 0;
+
+	plug_gpio = of_get_named_gpio(spdev->dev.of_node,
+					   "qcom,dock-plug-det-irq", 0);
+
+	if (plug_gpio >= 0) {
+		msm8994_liquid_dock_dev =
+		 kzalloc(sizeof(*msm8994_liquid_dock_dev), GFP_KERNEL);
+		if (!msm8994_liquid_dock_dev) {
+			pr_err("msm8994_liquid_dock_dev alloc fail.\n");
+			ret = -ENOMEM;
+			goto exit;
+		}
+
+		msm8994_liquid_dock_dev->plug_gpio = plug_gpio;
+		msm8994_liquid_dock_dev->audio_sdev.name =
+						QC_AUDIO_EXTERNAL_SPK_1_EVENT;
+
+		if (switch_dev_register(
+			 &msm8994_liquid_dock_dev->audio_sdev) < 0) {
+			pr_err("%s: dock device register in switch diretory failed\n",
+				__func__);
+			goto exit;
+		}
+
+		INIT_WORK(
+			&msm8994_liquid_dock_dev->irq_work,
+			msm8994_liquid_docking_irq_work);
+
+		register_liquid_dock_notify(&msm8994_liquid_docking_notifier);
+	}
+	return 0;
+exit:
+	msm8994_liquid_dock_dev = NULL;
+	return ret;
+}
+
+static void apq8094_db_device_irq_work(struct work_struct *work)
+{
+	struct audio_plug_dev *plug_dev =
+		container_of(work, struct audio_plug_dev, irq_work);
+
+	plug_dev->plug_det =
+		gpio_get_value(plug_dev->plug_gpio);
+
+	switch_set_state(&plug_dev->audio_sdev, !(plug_dev->plug_det));
+
+	/*notify to audio deamon*/
+	sysfs_notify(&plug_dev->audio_sdev.dev->kobj, NULL, "state");
+}
+
+static int apq8094_db_device_init(void)
+{
+	int ret = 0;
+	int plug_gpio = 0;
+
+
+	plug_gpio = of_get_named_gpio(spdev->dev.of_node,
+					   "qcom,ext-spk-rear-panel-irq", 0);
+	if (plug_gpio >= 0) {
+		ret = msm8994_audio_plug_device_init(apq8094_db_ext_bp_out_dev,
+						plug_gpio,
+						"qcom,ext-spk-rear-panel-irq",
+						QC_AUDIO_EXTERNAL_SPK_2_EVENT,
+						&apq8094_db_device_irq_work);
+		if (ret != 0) {
+			pr_err("%s: external audio device init failed = %s\n",
+				__func__,
+				apq8094_db_ext_bp_out_dev->audio_sdev.name);
+			return ret;
+		}
+	}
+
+	plug_gpio = of_get_named_gpio(spdev->dev.of_node,
+					   "qcom,ext-spk-front-panel-irq", 0);
+	if (plug_gpio >= 0) {
+		ret = msm8994_audio_plug_device_init(apq8094_db_ext_fp_out_dev,
+						plug_gpio,
+						"qcom,ext-spk-front-panel-irq",
+						QC_AUDIO_EXTERNAL_SPK_1_EVENT,
+						&apq8094_db_device_irq_work);
+		if (ret != 0) {
+			pr_err("%s: external audio device init failed = %s\n",
+				__func__,
+				apq8094_db_ext_fp_out_dev->audio_sdev.name);
+			return ret;
+		}
+	}
+
+	plug_gpio = of_get_named_gpio(spdev->dev.of_node,
+					   "qcom,ext-mic-front-panel-irq", 0);
+	if (plug_gpio >= 0) {
+		ret = msm8994_audio_plug_device_init(apq8094_db_ext_fp_in_dev,
+						plug_gpio,
+						"qcom,ext-mic-front-panel-irq",
+						QC_AUDIO_EXTERNAL_MIC_EVENT,
+						&apq8094_db_device_irq_work);
+		if (ret != 0)
+			pr_err("%s: external audio device init failed = %s\n",
+				__func__,
+				apq8094_db_ext_fp_in_dev->audio_sdev.name);
+	}
+
+	return ret;
 }
 
 static void msm8994_ext_control(struct snd_soc_codec *codec)
@@ -240,35 +595,6 @@ static int msm8994_set_spk(struct snd_kcontrol *kcontrol,
 	msm8994_ext_control(codec);
 	return 1;
 }
-
-// chenjun
-static int codec_mclk_get(struct snd_kcontrol *kcontrol,
-		       struct snd_ctl_elem_value *ucontrol)
-{
-	pr_err("%s: chenjun: codec_mclk_control(%d)\n",
-			 __func__, codec_mclk_control);
-	ucontrol->value.integer.value[0] = codec_mclk_control;
-	return 0;
-}
-
-static int codec_mclk_put(struct snd_kcontrol *kcontrol,
-		       struct snd_ctl_elem_value *ucontrol)
-{
-	struct snd_soc_codec *codec = snd_kcontrol_chip(kcontrol);
-
-	pr_err("%s: chenjun: codec_mclk_control(%d), put val(%ld)\n",
-			 __func__, codec_mclk_control, ucontrol->value.integer.value[0]);
-
-	if (codec_mclk_control == ucontrol->value.integer.value[0])
-		return 0;
-
-	codec_mclk_control = ucontrol->value.integer.value[0];
-
-	msm_snd_enable_codec_ext_clk(codec, codec_mclk_control, true);
-
-	return 1;
-}
-//
 
 static int msm8994_ext_us_amp_init(void)
 {
@@ -325,7 +651,7 @@ static int msm_snd_enable_codec_ext_clk(struct snd_soc_codec *codec, int enable,
 					bool dapm)
 {
 	int ret = 0;
-	pr_err("%s: enable = %d clk_users = %d\n",
+	pr_debug("%s: enable = %d clk_users = %d\n",
 		__func__, enable, clk_users);
 
 	mutex_lock(&cdc_mclk_mutex);
@@ -369,7 +695,7 @@ exit:
 static int msm8994_mclk_event(struct snd_soc_dapm_widget *w,
 		struct snd_kcontrol *kcontrol, int event)
 {
-	pr_err("%s: chenjun:event = %d\n", __func__, event); // chenjun
+	pr_debug("%s: event = %d\n", __func__, event);
 
 	switch (event) {
 	case SND_SOC_DAPM_PRE_PMU:
@@ -384,6 +710,7 @@ static const struct snd_soc_dapm_widget msm8994_dapm_widgets[] = {
 
 	SND_SOC_DAPM_SUPPLY("MCLK",  SND_SOC_NOPM, 0, 0,
 	msm8994_mclk_event, SND_SOC_DAPM_PRE_PMU | SND_SOC_DAPM_POST_PMD),
+
 
 	SND_SOC_DAPM_SPK("ultrasound amp", msm_ext_ultrasound_event),
 	SND_SOC_DAPM_MIC("Handset Mic", NULL),
@@ -524,6 +851,25 @@ static int msm_slim_0_tx_ch_put(struct snd_kcontrol *kcontrol,
 	msm_slim_0_tx_ch = ucontrol->value.integer.value[0] + 1;
 
 	pr_debug("%s: msm_slim_0_tx_ch = %d\n", __func__, msm_slim_0_tx_ch);
+	return 1;
+}
+
+static int msm_vi_feed_tx_ch_get(struct snd_kcontrol *kcontrol,
+	struct snd_ctl_elem_value *ucontrol)
+{
+	ucontrol->value.integer.value[0] = (msm_vi_feed_tx_ch/2 - 1);
+	pr_debug("%s: msm_vi_feed_tx_ch = %ld\n", __func__,
+		 ucontrol->value.integer.value[0]);
+	return 0;
+}
+
+static int msm_vi_feed_tx_ch_put(struct snd_kcontrol *kcontrol,
+	struct snd_ctl_elem_value *ucontrol)
+{
+	msm_vi_feed_tx_ch =
+		roundup_pow_of_two(ucontrol->value.integer.value[0] + 2);
+
+	pr_debug("%s: msm_vi_feed_tx_ch = %d\n", __func__, msm_vi_feed_tx_ch);
 	return 1;
 }
 
@@ -1082,17 +1428,12 @@ static int msm_tx_be_hw_params_fixup(struct snd_soc_pcm_runtime *rtd,
 	struct snd_interval *channels = hw_param_interval(params,
 					SNDRV_PCM_HW_PARAM_CHANNELS);
 
-	param_set_mask(params, SNDRV_PCM_HW_PARAM_FORMAT,
-				msm_pri_mi2s_bit_format); // chenjun
-
 	pr_debug("%s: channel:%d\n", __func__, msm_pri_mi2s_tx_ch);
-	rate->min = rate->max = msm_pri_mi2s_sample_rate; // chenjun:orig:SAMPLING_RATE_48KHZ
+	rate->min = rate->max = SAMPLING_RATE_48KHZ;
 	channels->min = channels->max = msm_pri_mi2s_tx_ch;
 	return 0;
 }
 
-// chenjun
-#if 0
 static int msm8994_mi2s_snd_startup(struct snd_pcm_substream *substream)
 {
 	int ret = 0;
@@ -1160,146 +1501,6 @@ static void msm8994_mi2s_snd_shutdown(struct snd_pcm_substream *substream)
 		pr_err("%s: Reset pinctrl failed with %d\n",
 			__func__, ret);
 }
-#else
-static int prim_mi2s_clk_ctl(struct snd_soc_pcm_runtime *rtd, bool enable)
-{
-	struct snd_soc_card *card = rtd->card;
-	struct msm8994_asoc_mach_data *pdata = snd_soc_card_get_drvdata(card);
-	struct afe_clk_cfg *lpass_clk = NULL;
-	int ret = 0;
-
-	if (pdata == NULL) {
-		pr_err("%s:platform data is null\n", __func__);
-		return -ENOMEM;
-	}
-	lpass_clk = kzalloc(sizeof(struct afe_clk_cfg), GFP_KERNEL);
-	if (lpass_clk == NULL) {
-		pr_err("%s:Failed to allocate memory\n", __func__);
-		return -ENOMEM;
-	}
-	memcpy(lpass_clk, &mi2s_tx_clk, sizeof(struct afe_clk_cfg));
-
-	pr_err("%s:enable(%x), clk_usrs(%d)\n", __func__, enable, pdata->pri_mi2s_clk_usrs);
-
-	if (enable) {
-		if (pdata->pri_mi2s_clk_usrs == 0) {
-			lpass_clk->clk_val2 = Q6AFE_LPASS_OSR_CLK_12_P288_MHZ;
-			lpass_clk->clk_val1 = Q6AFE_LPASS_IBIT_CLK_1_P536_MHZ;
-			lpass_clk->clk_set_mode = Q6AFE_LPASS_MODE_BOTH_VALID;
-
-       		ret = afe_set_lpass_clock(AFE_PORT_ID_PRIMARY_MI2S_RX, lpass_clk);	
-       		if (ret < 0) {	
-      			    pr_err("%s: afe_set_lpass_clock RX failed\n", __func__);	
-       		}	
-
-                    ret = afe_set_lpass_clock(AFE_PORT_ID_PRIMARY_MI2S_TX, lpass_clk);
-                    if (ret < 0)
-                    	pr_err("%s:afe_set_lpass_clock failed\n", __func__);
-                    }
-			pdata->pri_mi2s_clk_usrs++;
-	} else {
-		if (pdata->pri_mi2s_clk_usrs > 0)
-			pdata->pri_mi2s_clk_usrs--;
-		if (pdata->pri_mi2s_clk_usrs == 0) {
-			lpass_clk->clk_val2 = Q6AFE_LPASS_OSR_CLK_DISABLE;
-			lpass_clk->clk_set_mode = Q6AFE_LPASS_MODE_BOTH_VALID;
-			lpass_clk->clk_val1 = Q6AFE_LPASS_IBIT_CLK_DISABLE;
-
-       		ret = afe_set_lpass_clock(AFE_PORT_ID_PRIMARY_MI2S_RX, lpass_clk);	
-       		if (ret < 0) {	
-      			    pr_err("%s: afe_set_lpass_clock RX failed\n", __func__);	
-       		}	
-
-                    ret = afe_set_lpass_clock(AFE_PORT_ID_PRIMARY_MI2S_TX, lpass_clk);
-                    if (ret < 0)
-                    	pr_err("%s:afe_set_lpass_clock failed\n", __func__);
-                    }
-	}
-	pr_err("%s: clk 1 = %#X clk2 = %#X mode = %d\n",
-			 __func__, lpass_clk->clk_val1,
-			lpass_clk->clk_val2,
-			lpass_clk->clk_set_mode);
-	kfree(lpass_clk);
-	return ret;
-}
-
-static int msm8994_mi2s_snd_startup(struct snd_pcm_substream *substream)
-{
-	int ret = 0;
-	struct snd_soc_pcm_runtime *rtd = substream->private_data;
-	struct snd_soc_card *card = rtd->card;
-	struct snd_soc_dai *cpu_dai = rtd->cpu_dai;
-	struct msm8994_asoc_mach_data *pdata = snd_soc_card_get_drvdata(card);
-	struct msm_pinctrl_info *pinctrl_info = &pdata->pinctrl_info;
-
-	pr_err("%s: substream = %s, stream = %d, prim_mi2s_ref_count = %d\n", __func__,
-		substream->name, substream->stream, atomic_read(&prim_mi2s_ref_count));
-
-	if (pinctrl_info == NULL) {
-		pr_err("%s: pinctrl_info is NULL\n", __func__);
-		ret = -EINVAL;
-		goto err;
-	}
-
-	if (atomic_inc_return(&prim_mi2s_ref_count) == 1) {
-	    if (pdata->pri_mux != NULL) {
-		iowrite32(I2S_PCM_SEL_I2S << I2S_PCM_SEL_OFFSET,
-				pdata->pri_mux);
-	    } else {
-		pr_err("%s: MI2S muxsel addr is NULL\n", __func__);
-	    } 
-
-	    ret = msm_set_pinctrl(pinctrl_info, STATE_MI2S_ACTIVE);
-	    if (ret) {
-		pr_err("%s: MI2S TLMM pinctrl set failed with %d\n",
-			__func__, ret);
-		return ret;
-	    }
-
-	    ret = prim_mi2s_clk_ctl(rtd, true);
-	    if (ret < 0) {
-		pr_err("%s: enable afe lpass clock failed, err:%d\n", __func__, ret);
-		goto err;
-	    }
-
-           /*
-           * This sets the CONFIG PARAMETER WS_SRC.
-           * SND_SOC_DAIFMT_CBS_CFS means internal clock master mode.
-           * SND_SOC_DAIFMT_CBM_CFM means external clock slave mode.
-           */
-	    ret = snd_soc_dai_set_fmt(cpu_dai, SND_SOC_DAIFMT_CBS_CFS);
-	    if (ret < 0)
-	        pr_err("%s: set fmt cpu dai failed, err:%d\n", __func__, ret);
-	    }
-err:
-	return ret;
-}
-
-static void msm8994_mi2s_snd_shutdown(struct snd_pcm_substream *substream)
-{
-	struct snd_soc_pcm_runtime *rtd = substream->private_data;
-	struct snd_soc_card *card = rtd->card;
-	struct msm8994_asoc_mach_data *pdata = snd_soc_card_get_drvdata(card);
-	struct msm_pinctrl_info *pinctrl_info = &pdata->pinctrl_info;
-	int ret = 0;
-
-	pr_err("%s: substream = %s, stream = %d, prim_mi2s_ref_count = %d\n", __func__,
-		substream->name, substream->stream, atomic_read(&prim_mi2s_ref_count));
-
-	if (atomic_dec_return(&prim_mi2s_ref_count) == 0) {
-	    ret = prim_mi2s_clk_ctl(rtd, false);
-	    if (ret < 0) {
-		pr_err("%s: disable afe lpass clock failed, err:%d\n", __func__, ret);
-	    }
-
-	    ret = msm_reset_pinctrl(pinctrl_info, STATE_MI2S_ACTIVE);
-	    if (ret) {
-		pr_err("%s: Reset pinctrl failed with %d\n",
-			__func__, ret);
-	    }
-	}
-}
-#endif
 
 static struct snd_soc_ops msm8994_mi2s_be_ops = {
 	.startup = msm8994_mi2s_snd_startup,
@@ -1339,7 +1540,7 @@ static int msm_slim_0_tx_be_hw_params_fixup(struct snd_soc_pcm_runtime *rtd,
 
 	pr_debug("%s()\n", __func__);
 	param_set_mask(params, SNDRV_PCM_HW_PARAM_FORMAT,
-				   slim0_tx_bit_format);
+				   slim0_rx_bit_format);
 	rate->min = rate->max = 48000;
 	channels->min = channels->max = msm_slim_0_tx_ch;
 
@@ -1355,10 +1556,9 @@ static int msm_slim_4_tx_be_hw_params_fixup(struct snd_soc_pcm_runtime *rtd,
 	struct snd_interval *channels = hw_param_interval(params,
 			SNDRV_PCM_HW_PARAM_CHANNELS);
 
-	pr_debug("%s()\n", __func__);
 	rate->min = rate->max = 48000;
-	channels->min = channels->max = 2;
-
+	channels->min = channels->max = msm_vi_feed_tx_ch;
+	pr_debug("%s: %d\n", __func__, msm_vi_feed_tx_ch);
 	return 0;
 }
 
@@ -1425,6 +1625,10 @@ static const struct soc_enum msm_snd_enum[] = {
 	SOC_ENUM_SINGLE_EXT(3, slim0_rx_sample_rate_text),
 	SOC_ENUM_SINGLE_EXT(8, proxy_rx_ch_text),
 	SOC_ENUM_SINGLE_EXT(3, hdmi_rx_sample_rate_text),
+	SOC_ENUM_SINGLE_EXT(2, vi_feed_ch_text),
+#ifdef CONFIG_HEADPHONE_SWITCH
+	SOC_ENUM_SINGLE_EXT(2, headphone_switch_text),
+#endif
 };
 
 static const struct snd_kcontrol_new msm_snd_controls[] = {
@@ -1434,6 +1638,8 @@ static const struct snd_kcontrol_new msm_snd_controls[] = {
 			msm_slim_0_rx_ch_get, msm_slim_0_rx_ch_put),
 	SOC_ENUM_EXT("SLIM_0_TX Channels", msm_snd_enum[2],
 			msm_slim_0_tx_ch_get, msm_slim_0_tx_ch_put),
+	SOC_ENUM_EXT("VI_FEED_TX Channels", msm_snd_enum[8],
+			msm_vi_feed_tx_ch_get, msm_vi_feed_tx_ch_put),
 	SOC_ENUM_EXT("AUX PCM SampleRate", msm8994_auxpcm_enum[0],
 			msm8994_auxpcm_rate_get, msm8994_auxpcm_rate_put),
 	SOC_ENUM_EXT("HDMI_RX Channels", msm_snd_enum[3],
@@ -1450,10 +1656,10 @@ static const struct snd_kcontrol_new msm_snd_controls[] = {
 		     msm_btsco_rate_get, msm_btsco_rate_put),
 	SOC_ENUM_EXT("HDMI_RX SampleRate", msm_snd_enum[7],
 			hdmi_rx_sample_rate_get, hdmi_rx_sample_rate_put),
-// chenjun
-	SOC_ENUM_EXT("Codec MCLK Switch", msm_snd_enum[0], codec_mclk_get,
-			codec_mclk_put),
-//
+#ifdef CONFIG_HEADPHONE_SWITCH
+	SOC_ENUM_EXT("Headphone Switch",msm_snd_enum[9],
+			headphone_switch_gpio_get, headphone_switch_gpio_put),
+#endif
 };
 
 static bool msm8994_swap_gnd_mic(struct snd_soc_codec *codec)
@@ -1597,6 +1803,13 @@ static int msm_audrx_init(struct snd_soc_pcm_runtime *rtd)
 		return err;
 	}
 
+	err = msm8994_liquid_init_docking();
+	if (err) {
+		pr_err("%s: 8994 init Docking stat IRQ failed (%d)\n",
+			   __func__, err);
+		return err;
+	}
+
 	err = msm8994_ext_us_amp_init();
 	if (err) {
 		pr_err("%s: MTP 8994 US Emitter GPIO init failed (%d)\n",
@@ -1611,6 +1824,20 @@ static int msm_audrx_init(struct snd_soc_pcm_runtime *rtd)
 	snd_soc_dapm_enable_pin(dapm, "Lineout_3 amp");
 	snd_soc_dapm_enable_pin(dapm, "Lineout_2 amp");
 	snd_soc_dapm_enable_pin(dapm, "Lineout_4 amp");
+
+	snd_soc_dapm_ignore_suspend(dapm, "AIN1");
+	snd_soc_dapm_ignore_suspend(dapm, "AIN2");
+	snd_soc_dapm_ignore_suspend(dapm, "AIN3");
+	snd_soc_dapm_ignore_suspend(dapm, "AIN4");
+	snd_soc_dapm_ignore_suspend(dapm, "DMIC1");
+	snd_soc_dapm_ignore_suspend(dapm, "DMIC2");
+	snd_soc_dapm_ignore_suspend(dapm, "MRF1");
+	snd_soc_dapm_ignore_suspend(dapm, "MRF2");
+	snd_soc_dapm_ignore_suspend(dapm, "HP");
+	snd_soc_dapm_ignore_suspend(dapm, "RCV");
+	snd_soc_dapm_ignore_suspend(dapm, "Smart PA Output");
+	snd_soc_dapm_ignore_suspend(dapm, "Smart PA Input");
+	snd_soc_dapm_ignore_suspend(dapm, "Smart PA Init Switch");
 
 	snd_soc_dapm_sync(dapm);
 
@@ -1752,6 +1979,8 @@ static int msm_snd_hw_params(struct snd_pcm_substream *substream,
 			 * this DAI is based on that of the Rx path.
 			 */
 			user_set_tx_ch = msm_slim_0_rx_ch;
+		else if (dai_link->be_id == MSM_BACKEND_DAI_SLIMBUS_4_TX)
+			user_set_tx_ch = msm_vi_feed_tx_ch;
 		else
 			user_set_tx_ch = tx_ch_cnt;
 
@@ -2469,24 +2698,6 @@ static struct snd_soc_dai_link msm8994_common_dai_links[] = {
 		 /* this dainlink has playback support */
 		.be_id = MSM_FRONTEND_DAI_MULTIMEDIA16,
 	},
-#if 0 // chenjun
-	/* CPE LSM direct dai-link */
-	{
-		.name = "CPE Listen service",
-		.stream_name = "CPE Listen Audio Service",
-		.cpu_dai_name = "CPE_LSM_NOHOST",
-		.platform_name = "msm-cpe-lsm",
-		.trigger = {SND_SOC_DPCM_TRIGGER_POST,
-			    SND_SOC_DPCM_TRIGGER_POST },
-		.no_host_mode = SND_SOC_DAI_LINK_NO_HOST,
-		.ignore_suspend = 1,
-		.ignore_pmdown_time = 1,
-		.codec_dai_name = "tomtom_mad1",
-		.codec_name = "tomtom_codec",
-	},
-#endif
-	/* End of FE DAI LINK */
-	/* Backend FM DAI Links */
 	{
 		.name = LPASS_BE_INT_FM_RX,
 		.stream_name = "Internal FM Playback",
@@ -2776,22 +2987,7 @@ static struct snd_soc_dai_link msm8994_common_dai_links[] = {
 		.be_hw_params_fixup = msm_tx_be_hw_params_fixup,
 		.ops = &msm8994_mi2s_be_ops,
 		.ignore_suspend = 1,
-	},
-// chenjun
-	{
-		.name = LPASS_BE_PRI_MI2S_RX,
-		.stream_name = "Primary MI2S Playback",
-		.cpu_dai_name = "msm-dai-q6-mi2s.0",
-		.platform_name = "msm-pcm-routing",
-		.codec_name = "msm-stub-codec.1",
-		.codec_dai_name = "msm-stub-rx",
-		.no_pcm = 1,
-		.be_id = MSM_BACKEND_DAI_PRI_MI2S_RX,
-		.be_hw_params_fixup = &msm_tx_be_hw_params_fixup,
-		.ops = &msm8994_mi2s_be_ops,
-		.ignore_suspend = 1,
-	},
-//
+	}
 };
 
 static struct snd_soc_dai_link msm8994_hdmi_dai_link[] = {
@@ -2843,7 +3039,7 @@ static int msm8994_populate_dai_link_component_of_node(
 						"asoc-platform-names",
 						dai_link[i].platform_name);
 			if (index < 0) {
-				pr_debug("%s: No match found for platform name: %s\n",
+				pr_err("%s: No match found for platform name: %s\n",
 					__func__, dai_link[i].platform_name);
 				ret = index;
 				goto err;
@@ -3064,6 +3260,35 @@ static int msm8994_asoc_machine_probe(struct platform_device *pdev)
 			"qcom,us-euro-gpios", pdata->us_euro_gpio);
 		mbhc_cfg.swap_gnd_mic = msm8994_swap_gnd_mic;
 	}
+#ifdef CONFIG_HEADPHONE_SWITCH
+    headphone_switch_gpio = of_get_named_gpio(pdev->dev.of_node,"qcom,headphone-switch-gpio", 0);
+    if (headphone_switch_gpio >= 0) {
+        ret = gpio_request(headphone_switch_gpio, "headphone_gpio");
+        if (ret) {
+            pr_err("%s: headphone_switch_gpio request failed, ret:%d\n",
+                    __func__, ret);
+        } else {
+            gpio_direction_output(headphone_switch_gpio, 0);
+            printk("headphone_switch_gpio is default value %d\n",gpio_get_value(headphone_switch_gpio));
+        }
+    } else {
+        pr_err("qcom,headphone-switch-gpio has no .........\n");
+    }
+
+    tps_enable_gpio = of_get_named_gpio(pdev->dev.of_node,"qcom,tps-enable-gpio", 0);
+    if (tps_enable_gpio >= 0) {
+        ret = gpio_request(tps_enable_gpio , "tps_enable_gpio");
+        if (ret) {
+            pr_err("%s:tps_enable_gpio request failed, ret:%d\n",
+                    __func__, ret);
+        } else {
+            gpio_direction_output(tps_enable_gpio , 0);
+            printk("tps_enable_gpio is default value %d\n",gpio_get_value(tps_enable_gpio));
+        }
+    } else {
+        pr_err("qcom,tps-switch-gpio has no .........\n");
+    }
+#endif
 
 	ret = msm8994_prepare_us_euro(card);
 	if (ret)
@@ -3080,13 +3305,17 @@ static int msm8994_asoc_machine_probe(struct platform_device *pdev)
 			__func__, ret);
 		goto err;
 	}
+	ret = apq8094_db_device_init();
+	if (ret) {
+		pr_err("%s: DB8094 init ext devices stat IRQ failed (%d)\n",
+				__func__, ret);
+		goto err1;
+	}
 
 	return 0;
 
-#if 0 // chenjun
 err1:
 	msm_release_pinctrl(pdev);
-#endif
 err:
 	if (pdata->mclk_gpio > 0) {
 		dev_dbg(&pdev->dev, "%s free gpio %d\n",
@@ -3114,6 +3343,13 @@ static int msm8994_asoc_machine_remove(struct platform_device *pdev)
 
 	gpio_free(pdata->mclk_gpio);
 	gpio_free(pdata->us_euro_gpio);
+
+	msm8994_audio_plug_device_remove(msm8994_liquid_dock_dev);
+
+	msm8994_audio_plug_device_remove(apq8094_db_ext_bp_out_dev);
+	msm8994_audio_plug_device_remove(apq8094_db_ext_fp_in_dev);
+	msm8994_audio_plug_device_remove(apq8094_db_ext_fp_out_dev);
+
 	msm_release_pinctrl(pdev);
 	snd_soc_unregister_card(card);
 
